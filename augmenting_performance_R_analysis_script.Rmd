@@ -1,0 +1,1486 @@
+---
+title: "Analysis for Mindfulness-based Cognitive Training Study"
+author: "Chloe Dziego"
+date: "27/02/2024"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Data tidying/visualising packages
+library(tidyverse)
+library(moments)
+library(rstatix)
+library(dplyr)
+library(ggpubr)
+library(skimr)
+library(psych)
+library(eegUtils)
+
+#Packages for statistics
+library(emmeans)
+library(ggeffects)
+library(performance)
+library(lme4)
+library(splines)
+library(car)
+library(lmerOut)
+library(lmerTest)
+
+options(contrasts = c("contr.Sum","contr.helmert"))
+options(decorate.contr.Treatment="",decorate.contr.Sum="",decorate.contrasts=c("[", "]"))
+
+```
+
+```{r raincloud plot function}
+# Defining the geom_flat_violin function ----
+
+# Note: the below code modifies the
+# existing github page by removing a parenthesis in line 50
+
+"%||%" <- function(a, b) {
+  if (!is.null(a)) a else b
+}
+geom_flat_violin <- function(mapping = NULL, data = NULL, stat = "ydensity",
+                             position = "dodge", trim = TRUE, scale = "area",
+                             show.legend = NA, inherit.aes = TRUE, ...) {
+  layer(
+    data = data,
+    mapping = mapping,
+    stat = stat,
+    geom = GeomFlatViolin,
+    position = position,
+    show.legend = show.legend,
+    inherit.aes = inherit.aes,
+    params = list(
+      trim = trim,
+      scale = scale,
+      ...
+    )
+  )
+}
+#' @rdname ggplot2-ggproto
+#' @format NULL
+#' @usage NULL
+#' @export
+GeomFlatViolin <-
+  ggproto("GeomFlatViolin", Geom,
+          setup_data = function(data, params) {
+            data$width <- data$width %||%
+              params$width %||% (resolution(data$x, FALSE) * 0.9)
+            # ymin, ymax, xmin, and xmax define the bounding rectangle for each group
+            data %>%
+              group_by(group) %>%
+              mutate(
+                ymin = min(y),
+                ymax = max(y),
+                xmin = x,
+                xmax = x + width / 2
+              )
+          },
+          draw_group = function(data, panel_scales, coord) {
+            # Find the points for the line to go all the way around
+            data <- transform(data,
+                              xminv = x,
+                              xmaxv = x + violinwidth * (xmax - x)
+            )
+            # Make sure it's sorted properly to draw the outline
+            newdata <- rbind(
+              plyr::arrange(transform(data, x = xminv), y),
+              plyr::arrange(transform(data, x = xmaxv), -y)
+            )
+            # Close the polygon: set first and last point the same
+            # Needed for coord_polar and such
+            newdata <- rbind(newdata, newdata[1, ])
+            ggplot2:::ggname("geom_flat_violin", GeomPolygon$draw_panel(newdata, panel_scales, coord))
+          },
+          draw_key = draw_key_polygon,
+          default_aes = aes(
+            weight = 1, colour = "grey20", fill = "white", size = 0.5,
+            alpha = NA, linetype = "solid"
+          ),
+          required_aes = c("x", "y")
+  )
+
+outlierKD <- function(dt, var) {
+     var_name <- eval(substitute(var),eval(dt))
+     na1 <- sum(is.na(var_name))
+     m1 <- mean(var_name, na.rm = T)
+     par(mfrow=c(2, 2), oma=c(0,0,3,0))
+     boxplot(var_name, main="With outliers")
+     hist(var_name, main="With outliers", xlab=NA, ylab=NA)
+     outlier <- boxplot.stats(var_name)$out
+     mo <- mean(outlier)
+     var_name <- ifelse(var_name %in% outlier, NA, var_name)
+     boxplot(var_name, main="Without outliers")
+     hist(var_name, main="Without outliers", xlab=NA, ylab=NA)
+     title("Outlier Check", outer=TRUE)
+     na2 <- sum(is.na(var_name))
+     cat("Outliers identified:", na2 - na1, "n")
+     cat("Propotion (%) of outliers:", round((na2 - na1) / sum(!is.na(var_name))*100, 1), "n")
+     cat("Mean of the outliers:", round(mo, 2), "n")
+     m2 <- mean(var_name, na.rm = T)
+     cat("Mean without removing outliers:", round(m1, 2), "n")
+     cat("Mean if we remove outliers:", round(m2, 2), "n")
+     response <- readline(prompt="Do you want to remove outliers and to replace with NA? [yes/no]: ")
+     if(response == "y" | response == "yes"){
+          dt[as.character(substitute(var))] <- invisible(var_name)
+          assign(as.character(as.list(match.call())$dt), dt, envir = .GlobalEnv)
+          cat("Outliers successfully removed", "n")
+          return(invisible(dt))
+     } else{
+          cat("Nothing changed", "n")
+          return(invisible(var_name))
+     }
+}
+```
+
+```{r read in data + tidy}
+
+##Prepare Neural and Performance Variable Data
+iaf <- read.delim("iaf_output.txt", header = TRUE)
+iaf$subj <- as.factor(iaf$subj)
+iaf$session <- as.factor(iaf$session)
+iaf <- pivot_wider(iaf, names_from = measure, values_from = value)
+
+aperiodic <- read.csv("aperiodic.csv") %>%
+  dplyr::select(Chan, Intercept, Slope, subj, session) %>%
+  filter(Chan == "Pz" | Chan == "P3" | Chan == "P4" | Chan == "O1" | Chan == "Oz" | Chan == "O2" | Chan == "P7" | Chan == "P8")
+
+mean_sl <- aggregate(aperiodic$Slope, by = list(aperiodic$subj, aperiodic$session), FUN = mean) %>%
+  dplyr::rename("subj" = Group.1,
+         "session" = Group.2,
+         "slope" = x)
+
+mean_int <- aggregate(aperiodic$Intercept, by = list(aperiodic$subj, aperiodic$session), FUN = mean) %>%
+  dplyr::rename("subj" = Group.1,
+         "session" = Group.2,
+         "intercept" = x)
+
+tpe <- read_csv("all_tpe.csv") %>%
+  na.omit()
+
+tpe$session <- as.factor(tpe$session)
+tpe$subj <- as.factor(tpe$subj)
+
+all_ap <- left_join(mean_sl, mean_int, by = c("subj", "session"))
+all_ap$session <- as.factor(all_ap$session)
+
+iaf_ap <- left_join(all_ap, iaf, by = c("subj", "session"))
+almost <- left_join(tpe, iaf_ap, by = c("subj", "session"))
+  
+data_woct <- subset(almost, Time!="0") %>%
+  filter(subj != "CT22" & subj != "CT25")
+
+data_woct$subj <- as.factor(data_woct$subj)
+
+check <- data_woct %>%
+  group_by(subj) %>%
+  count() 
+
+```
+
+``` {r code topoplots}
+
+#Create Topoplots for Visualising Neural Variables across the Scalp
+library(eegUtils)
+
+for_topo1 <- read.csv("aperiodic.csv") %>%
+  dplyr::select(Chan, Intercept, Slope, subj, session) %>%
+  filter(session == 1) %>%
+  rename(electrode = Chan) %>%
+  group_by(electrode) %>%
+  summarise(amplitude = mean(Slope))
+
+for_topo2 <- read.csv("aperiodic.csv") %>%
+  dplyr::select(Chan, Intercept, Slope, subj, session) %>%
+  filter(session == 2) %>%
+  rename(electrode = Chan) %>%
+  group_by(electrode) %>%
+  summarise(amplitude = mean(Slope))
+
+for_topo1$electrode <- as.factor(for_topo1$electrode)
+
+topoplot(for_topo1, palette = "GnBu", limits = c(-1.5, -0.25))
+topoplot(for_topo2, palette = "GnBu", limits = c(-1.5, -0.25))
+
+int_topo1 <- read.csv("aperiodic.csv") %>%
+  dplyr::select(Chan, Intercept, Slope, subj, session) %>%
+  filter(session == 1) %>%
+  rename(electrode = Chan) %>%
+  group_by(electrode, session) %>%
+  summarise(amplitude = mean(Intercept))
+
+int_topo2 <- read.csv("aperiodic.csv") %>%
+  dplyr::select(Chan, Intercept, Slope, subj, session) %>%
+  filter(session == 2) %>%
+  rename(electrode = Chan) %>%
+  group_by(electrode) %>%
+  summarise(amplitude = mean(Intercept))
+
+int_topo1$electrode <- as.factor(int_topo1$electrode)
+
+topoplot(int_topo1, palette = "GnBu", limits = c(-30, -20))
+topoplot(int_topo2, palette = "GnBu", limits = c(-30, -20))
+
+recodedf <- structure(list(V1 = c('Fz',
+ 'F3',
+ 'F7',
+ 'FT9',
+ 'FC5',
+ 'FC1',
+ 'C3',
+ 'T7',
+ #'TP9', is number 8
+ 'CP5',
+ 'CP1',
+ 'Pz',
+ 'P3',
+ 'P7',
+ 'O1',
+ 'Oz',
+ 'O2',
+ 'P4',
+ 'P8',
+ #'TP10', is number 19
+ 'CP6',
+ 'CP2',
+ 'Cz',
+ 'C4',
+ 'T8',
+ 'FT10',
+ 'FC6',
+ 'FC2',
+ 'F4',
+ 'F8'), V2 = c(0:8, 9:18, 20:28)), .Names = c("V1", 
+    "V2"), class = "data.frame", row.names = c(NA, -29L))
+
+recodedf <- aperiodic %>%
+  select(X, Chan) %>%
+  rename(V2 = X, V1 = Chan) %>%
+  distinct()
+
+recodedf$V2 <- as.factor(recodedf$V2)
+
+#IAF per electrode
+iafelectrode <- read.delim("iaf_electrodes.txt", header = TRUE) %>%
+  rename(channel = electrode)
+
+iafelectrode$value <- as.numeric(iafelectrode$value)
+iafelectrode$electrode <- recodedf$V1[match(as.character(iafelectrode$channel), as.character(recodedf$V2))]
+iafelectrode$electrode <- as.factor(iafelectrode$electrode)
+
+iaf_topo1 <- iafelectrode %>%
+  dplyr::select(subj, measure, value, session, electrode) %>%
+  filter(measure == "cog") %>%
+  filter(session == 1) %>%
+  group_by(electrode) %>%
+  summarise(across(c('value'), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}")) %>%
+  rename(amplitude = mean_value)
+
+iaf_topo2 <- iafelectrode %>%
+  dplyr::select(subj, measure, value, session, electrode) %>%
+  filter(measure == "cog") %>%
+  filter(session == 2) %>%
+  group_by(electrode) %>%
+  summarise(across(c('value'), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}")) %>%
+  rename(amplitude = mean_value)
+
+topoplot(iaf_topo1, palette = "GnBu", limits = c(8, 11))
+topoplot(iaf_topo2, palette = "GnBu", limits = c(8, 11))
+
+iaf_topo12 <- iafelectrode %>%
+  dplyr::select(subj, measure, value, session, electrode) %>%
+  filter(measure == "paf") %>%
+  filter(session == 1) %>%
+  group_by(electrode) %>%
+  summarise(across(c('value'), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}")) %>%
+  rename(amplitude = mean_value)
+
+iaf_topo22 <- iafelectrode %>%
+  dplyr::select(subj, measure, value, session, electrode) %>%
+  filter(measure == "paf") %>%
+  filter(session == 2) %>%
+  group_by(electrode) %>%
+  summarise(across(c('value'), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}")) %>%
+  rename(amplitude = mean_value)
+
+topoplot(iaf_topo12, palette = "GnBu", limits = c(8, 11))
+topoplot(iaf_topo22, palette = "GnBu", limits = c(8, 11))
+
+```
+
+## Report Descriptives & Plots
+
+```{r descriptives}
+
+#Create Descriptive Tables
+neural1 <- filter(iaf_ap, session == "1")
+neural2 <- filter(iaf_ap, session == "2")
+
+describe(neural1)
+describe(neural2)
+
+meanslopes <- aggregate(iaf_ap$slope, by = list(iaf_ap$session), FUN = mean)%>%
+  dplyr::rename("session" = Group.1,
+         "slope" = x)
+meanint <- aggregate(iaf_ap$intercept, by = list(iaf_ap$session), FUN = mean)%>%
+  dplyr::rename("session" = Group.1,
+         "intercept" = x)
+
+aperiodicmeans <- left_join(meanslopes, meanint, by = "session")
+
+#Descriptives for Demographic Information
+demographics_all <- read_csv("demo.csv")
+
+demographics_all$sex <- as.factor(demographics_all$sex)
+demographics_all$scenario <- as.factor(demographics_all$scenario)
+summary(demographics_all)
+skim(demographics_all)
+
+#These subjects did not complete two sessions
+demographics <- demographics_all %>% filter(subj != "CT22" & subj != "CT25")
+
+summary(demographics)
+scenario_file <- demographics %>%
+  select(subj, scenario)
+
+```
+
+## Cognitive Training Adherence
+Number of times participant engaged in the cognitive training + MAAS. 
+
+```{r ct adherence}
+
+ct <- read_csv("ct_tracker.csv") %>%
+  select(subj, total)
+
+ct_all <- read_csv("ct_tracker.csv") %>%
+  select(subj, day1, day2, day3, day4, day5, day6, day7) %>%
+  filter(subj != "CT22" & subj != "CT25")
+
+day <- c(1:7)
+mean <- c(1.15, 1.5, 1.45, 1.5, 1.625, 1.6, 1.45)
+daily_avg <- data.frame(day, mean)
+
+summary(daily_avg)
+ggplot(daily_avg, aes(x = day, y = mean)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(lim = c(0, 3)) +
+  scale_x_continuous(n.breaks = 7) +
+  labs(x = "Day of Training", y = "Average Sessions Completed") +
+  theme_minimal() +
+  stat_regline_equation()
+
+summary(lm(mean ~ day, data = daily_avg))
+
+ct_mSD <- ct_all %>%
+  rowwise() %>%
+  mutate(mean = mean(c_across(day1:day7)),
+         SD = SD(c_across(day1:day7)))
+  
+skews = c()
+
+for(i in 1:nrow(ct_mSD)) {
+    row <- ct_mSD[i,]
+    sum1 <- (((row$day1)-(row$mean))/row$SD)^3
+    sum2 <- (((row$day2)-(row$mean))/row$SD)^3
+    sum3 <- (((row$day3)-(row$mean))/row$SD)^3
+    sum4 <- (((row$day4)-(row$mean))/row$SD)^3
+    sum5 <- (((row$day5)-(row$mean))/row$SD)^3
+    sum6 <- (((row$day6)-(row$mean))/row$SD)^3
+    sum7 <- (((row$day7)-(row$mean))/row$SD)^3
+    sum <- sum(sum1, sum2, sum3, sum4, sum5, sum6, sum7) 
+    skew_value <- (1/7)*sum
+    
+    skews[i] <- skew_value[1] 
+}
+
+ct_mSD[11] <- skews
+ct_skew <- ct_mSD %>%
+  rename(skew = ...11)
+
+maas_all <- read_csv("maas_scores.csv")
+
+#Remove Participants who were pilot/did not end up participating/or completing the full two sessions
+maas <- maas_all[c(3:52),18:30] %>%
+  filter(Q1 != "EXP99" & Q1 != "EXP02" & Q1 != "EXP01" & Q1 != "CT22" & Q1 != "CT25" & Q1 != "CT14"& Q1 != "EXP03" & Q1 != "EXP05" ) %>%
+  na.omit() %>%
+  mutate_at(vars(2:ncol(.)), list(~
+  case_when(
+    . == "Almost Always" ~ 1,
+    . == "Very Frequently" ~ 2,
+    . == "Somewhat Frequently" ~ 3,
+    . == "Somewhat Infrequently" ~ 4,
+    . == "Very Infrequently" ~ 5,
+    . == "Almost Never" ~ 6))) %>%
+  dplyr::rename("subj"=Q1)
+
+maas$MAAS <- rowSums(maas[2:12])/12
+maas.2 <- select(maas, subj, MAAS)
+
+summary(maas.2$MAAS)
+
+alpha(maas[2:13])
+describe(maas.2)
+ggplot(maas.2, aes(x=MAAS)) +
+  geom_histogram()
+
+describe(ct)
+
+data <- left_join(data_woct, ct, by = c("subj")) %>%
+  dplyr::rename("training" = total)
+data$TPE <- as.integer(data$TPE)
+
+objective_report <- ggplot(ct, aes(subj, total)) + 
+  geom_col(fill = c("seagreen3"), alpha = 0.4) +
+  ylab("Number of Sessions") +
+  scale_y_continuous(limits = c(0, 20)) +
+  ggtitle("A. Engagement (Analytics)") +
+  theme_minimal() +
+  theme(axis.title.y= element_text(size = 16),
+        axis.title.x= element_blank(),
+        axis.text.y= element_text(size = 15),
+        axis.text.x= element_text(size = 14),
+        plot.title = element_text(size=16, face="bold"))
+
+tiff("frequency_of_engagement.tiff", units="in", width=10, height=7, res=300)
+
+ggplot(ct, aes(x=total)) +
+  geom_histogram(fill = "turquoise2", alpha = 0.4) +
+  labs(title= "Frequency Histogram of Cognitive Training Adherence", x = "Audio Tracks Completed", y = "Number of Participants") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(size = "16"),
+        axis.title.x = element_text(size ="16"),
+        axis.text.y =element_text(size = "16"),
+        axis.title.y = element_text(size ="16"))
+dev.off()
+
+#New Data Frame with Low/High Dichotomies
+ct_extra <- mutate(ct, level = case_when(total > 10 ~ "High",
+                                   total < 10 ~ "Low")) %>%
+   filter(subj != "CT22" & subj != "CT25")
+
+#Create dataframe of neural variables and cognitive training data
+iaf_ct <- left_join(iaf, ct_extra, by = "subj") %>%
+  na.omit()
+
+
+```
+
+## Initial Data Exploration
+
+First visualisation of neural metrics change across session 1 and 2.
+
+```{r data exploration neural}
+
+paf.plot <- ggplot(iaf, aes(x = session, y = paf, fill = session, group = session)) +
+  geom_boxplot(alpha=0.4, fill = c('turquoise2','seagreen3'), outlier.shape = NA, coef = 0, width = 0.3) +
+  geom_line(aes(group = subj), alpha = 0.3, size = 0.4, position = position_dodge(0.4)) +
+  geom_point(aes(group = subj), size = 2, shape = 19, alpha = 0.2, colour = "black", position = position_dodge(0.4)) +
+  ylab("Individual Alpha Frequency (IAF)") +
+  xlab("Session") +
+  ggtitle("C. Peak Alpha Frequency") +
+  scale_x_discrete(labels=c("Pre-Meditiation", "Post-Meditation")) +
+  theme_bw() + 
+  theme(legend.position="none",
+        panel.border = element_rect(color="black", fill=NA, size = 1),
+        axis.text.x = element_text(size = 14),
+        plot.title = element_text(size=14, face="bold"),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_blank())
+
+paf.plot
+
+cog.plot <- ggplot(iaf, aes(x = session, y = cog, fill = session, group = session)) +
+  geom_boxplot(alpha=0.4, fill = c('turquoise2','seagreen3'), outlier.shape = NA, coef = 0, width = 0.3) +
+  geom_line(aes(group = subj), alpha = 0.3, size = 0.4, position = position_dodge(0.4)) +
+  geom_point(aes(fill = session, group = subj), size = 2, shape = 19, alpha = 0.2, colour = "black", position = position_dodge(0.4)) +
+  ylab("Individual Alpha Frequency (IAF)") +
+  xlab("Session") +
+  scale_x_discrete(labels=c("Pre-Meditiation", "Post-Meditation")) +
+  scale_y_continuous(limits = c(9.5, 12)) +
+  ggtitle("D. Centre of Gravity") +
+  theme_bw() + 
+  theme(legend.position="none",
+        panel.border = element_rect(color="black", fill=NA, size = 1),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        plot.title = element_text(size=14, face="bold"),
+        axis.title.x = element_blank())
+
+tiff("iaf_session.tiff", units="in", width=12, height=6, res=300)
+ggarrange(paf.plot, cog.plot, common.legend = FALSE)
+dev.off()
+
+mean_sl$session <- as.factor(mean_sl$session)
+mean_int$session <- as.factor(mean_int$session)
+
+slope.plot <- ggplot(mean_sl, aes(x = session, y = slope, fill = session, group = session)) +
+  geom_boxplot(alpha=0.4, fill = c('turquoise2','seagreen3'), outlier.shape = NA, coef = 0, width = 0.3) +
+  geom_line(aes(group = subj), alpha = 0.3, size = 0.4, position = position_dodge(0.4)) +
+  geom_point(aes(group = subj), size = 2, shape = 19, alpha = 0.2, colour = "black", position = position_dodge(0.4)) +
+  ylab("Aperiodic 1/f Slope") +
+  ggtitle("E. 1/f Slope") +
+  scale_x_discrete(labels=c("Pre-Meditiation", "Post-Meditation")) +
+  theme_bw() + 
+  theme(legend.position="none",
+        panel.border = element_rect(color="black", fill=NA, size = 1),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        plot.title = element_text(size=14, face="bold"),
+        axis.title.y = element_text(size = 14),
+        axis.title.x = element_blank())
+
+slope.plot
+
+intercept.plot <- ggplot(mean_int, aes(x = session, y = intercept, fill = session, group = session)) +
+  geom_boxplot(alpha=0.4, fill = c('turquoise2','seagreen3'), outlier.shape = NA, coef = 0, width = 0.3) +
+  geom_line(aes(group = subj), alpha = 0.3, size = 0.4, position = position_dodge(0.4)) +
+  geom_point(aes(fill = session, group = subj), size = 2, shape = 19, alpha = 0.2, colour = "black", position = position_dodge(0.4)) +
+  ylab("Aperiodic 1/f Intercept") +
+  ggtitle("F. 1/f Intercept") +
+  scale_x_discrete(labels=c("Pre-Meditiation", "Post-Meditation")) +
+  theme_bw() + 
+  theme(legend.position="none",
+        panel.border = element_rect(color="black", fill=NA, size = 1),
+        axis.text.x = element_text(size = 14),
+        plot.title = element_text(size=14, face="bold"),
+        axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.title.x = element_blank())
+
+intercept.plot
+
+tiff("aperiodic_session.tiff", units="in", width=12, height=6, res=300)
+ggarrange(slope.plot, intercept.plot, common.legend = FALSE)
+dev.off()
+
+#t-tests of neural metrics from time 1 to 2
+ttest_slope <- pivot_wider(iaf_ap, id_cols = subj, names_from = session, values_from = slope)
+ttest_intercept <- pivot_wider(iaf_ap, id_cols = subj, names_from = session, values_from = intercept)
+ttest_cog <- pivot_wider(iaf_ap, id_cols = subj, names_from = session, values_from = cog)
+
+t.test(ttest_slope$'1', ttest_slope$'2', paired = TRUE)
+t.test(ttest_intercept$'1', ttest_intercept$'2', paired = TRUE)
+t.test(ttest_cog$'1', ttest_cog$'2', paired = TRUE)
+
+```
+
+## Visualisation of TPE 
+
+Examining changes in TPE across session 1 and 2.
+
+```{r tpe visualisation}
+
+group_labels = c("Pre-Meditation", "Post-Meditation")
+
+#All participant individual TPE scores over time
+ggplot(data, aes(x = Time, y = TPE)) +
+  geom_line(aes(colour = subj)) +
+  facet_grid(~session)
+
+indiv_tpe <- ggplot(data, aes(x = Time, y = TPE, colour = session, linetype = session)) +
+  geom_line(alpha = 0.7) +
+  scale_colour_manual(values = c('deepskyblue3','springgreen3'), labels = group_labels, name = "Session") +
+  scale_linetype_manual(values = c("solid", "dashed"), labels=group_labels, name = "Session") +
+  xlab("Time [20s]") +
+  ylab("Tactical Picture Error (TPE)") +
+  facet_wrap(~subj) +
+  theme_light() +
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        legend.text = element_text(size=12),
+        legend.title = element_blank())
+
+example <- data %>%
+  filter(subj == "CT38")
+ggplot(example, aes(x = Time, y = TPE, colour = session, linetype = session)) +
+  geom_line(alpha = 0.7, size = 0.9) +
+  scale_colour_manual(values = c('deepskyblue3','springgreen3'), labels = group_labels, name = "Session") +
+  scale_linetype_manual(values = c("solid", "dashed"), labels=group_labels, name = "Session") +
+  xlab("Time [20s]") +
+  ylab("Tactical Picture Error (TPE)") +
+  theme_light() +
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        legend.text = element_text(size=12),
+        legend.title = element_blank())
+
+tiff("TPE_individual.tiff", units="in", width=10, height=7, res=300)
+indiv_tpe
+dev.off()  
+
+#Mean TPE across sessions (with first 500 seconds)
+mean_tpe <- aggregate(data$TPE, by = list(data$subj, data$session), FUN = mean) %>%
+  dplyr::rename("subj" = Group.1,
+         "session" = Group.2,
+         "TPE" = x)
+
+mean_tpe %>%
+  filter(session == 1) %>%
+  describe()
+
+ggplot(mean_tpe, aes(x = session, y = TPE, fill = session, group = session)) +
+  geom_boxplot(alpha=0.4, fill = c('turquoise2','seagreen3'), outlier.shape = NA, coef = 0, width = .1) +
+  geom_line(aes(group = subj), alpha = 0.3, size = 0.4, position = position_dodge(0.4)) +
+  geom_point(aes(fill = session, group = subj), size = 3, shape = 19, alpha = 0.3, colour = "black", position = position_dodge(0.4)) +
+  ylab("Tactical Picture Error") +
+  ggtitle("Mean TPE Scores Across Sessions") +
+  scale_x_discrete(labels=c("Pre-Meditiation", "Post-Meditation")) +
+  theme_bw() + 
+  theme(legend.position="none",
+        panel.border = element_rect(color="black", fill=NA, size = 1),
+        axis.title = element_blank(),
+        axis.text.y = element_text(size=12),
+        axis.text.x = element_text(size=12))
+
+#Mean TPE across sessions (without first 500 seconds)
+mean_tpe500 <- filter(data, Time > 500)
+
+mean_500 <- aggregate(mean_tpe500$TPE, by = list(mean_tpe500$subj, mean_tpe500$session), FUN = mean) %>%
+  dplyr::rename("subj" = Group.1,
+         "session" = Group.2,
+         "TPE" = x)
+
+means <- ggplot(mean_500, aes(x = session, y = TPE, fill = session, group = session)) +
+  geom_boxplot(alpha=0.4, fill = c('turquoise2','seagreen3'), outlier.shape = NA, coef = 0, width = .3) +
+  geom_line(aes(group = subj), alpha = 0.3, size = 0.4, position = position_dodge(0.4)) +
+  geom_point(aes(fill = session, group = subj), size = 2, shape = 19, alpha = 0.2, colour = "black", position = position_dodge(0.4)) +
+  ylab("Mean TPE") +
+  ggtitle("A. Mean TPE across Session") +
+  scale_fill_manual(values = c('turquoise2','seagreen3'), labels=group_labels, name = "Session") +
+  scale_x_discrete(labels=group_labels, name = "Session") +
+    scale_y_continuous(limits = c(0, 18000)) +
+  theme_bw() + 
+  theme(legend.position="none",
+        plot.title = element_text(size=14, face="bold"),
+        panel.border = element_rect(color="black", fill=NA, size = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 14),
+        axis.text.y = element_text(size=12),
+        axis.text.x = element_text(size=12))
+
+means 
+
+#Mean TPE across Time and Sessions, collapsed for all participants
+avg_time <- data %>%
+  dplyr::select(TPE,Time,session) %>%
+  group_by(Time,session) %>%
+  dplyr::summarise(mean_TPE = mean(TPE),
+            se = (sd(TPE))/sqrt(n())) %>% 
+  mutate(Time = as.numeric(Time))
+
+over_time <- ggplot(avg_time, aes(x=Time, y=mean_TPE, fill=session, linetype = session))+
+  geom_smooth(color="black", size=0.5) +
+  scale_color_manual(values = c('turquoise2','seagreen3'), labels=group_labels, name = "Session") +
+  scale_fill_manual(values = c('turquoise2','seagreen3'), labels=group_labels, name = "Session") +
+  xlab("Time [20s]") + 
+  ylab("Mean Tactical Picture Error (TPE)") +
+  ggtitle("B. Mean TPE across Task Duration") +
+  scale_linetype_manual(values = c("solid", "dashed"), labels=group_labels, name = "Session") +
+  scale_x_continuous(limits = c(0, 2375)) +
+  theme_bw() +
+  theme(axis.title.x = element_text(size=14),
+                  plot.title = element_text(size=14, face="bold"),
+                  axis.text.x = element_text(size=12),
+                  panel.border = element_rect(color="black", fill=NA, size = 1),
+                  axis.text.y = element_text(size=12),
+                  legend.position = c(0.7, 0.8),
+                  legend.text = element_text(size = 12),
+                  legend.title = element_blank())
+
+over_time
+
+tiff("means.tiff", units="in", width=10, height=5, res=300)
+ggarrange(means, over_time, widths = c(6, 7), common.legend = FALSE)
+dev.off()
+
+#ggarrange all plots
+tiff("all_session.tiff", units="in", width=12, height=8, res=300)
+ggarrange(means, over_time, paf.plot, cog.plot, slope.plot, intercept.plot, nrow = 2, ncol = 3, common.legend = FALSE)
+dev.off()
+
+```
+
+#Creating Decline Variable and Baseline information for models
+
+```{r extract individual regression slopes between TPE and Time for first 500 seconds}
+
+# extract the individual regression slopes for TPE and Time
+# start with the practice session
+regression_data1 <- data %>%
+  dplyr::select(subj, TPE, Time, session) %>%
+  filter (session == "1" & Time < 500) %>%
+  dplyr::select(-session)
+
+regression_data2 <- data %>%
+  dplyr::select(subj, TPE, Time, session) %>%
+  filter (session == "2" & Time < 500) %>%
+  dplyr::select(-session)
+
+tpe_coefs1 = c()
+
+for (i in c(unique(regression_data1$subj))) {
+  # Create temporary data frame:
+  tpe_tmp <- regression_data1[regression_data1$subj==i,]
+  # Perform regression:
+  reg_result <- lm(tpe_tmp$TPE ~ tpe_tmp$Time)
+  # Get coefficient:
+  tmp_coef <- coef(reg_result)
+  # Store coefficient:
+  tpe_coefs1[i] <- tmp_coef[2]
+}
+
+tpe_coefs2 = c()
+
+for (i in c(unique(regression_data2$subj))) {
+  # Create temporary data frame:
+  tpe_tmp <- regression_data2[regression_data2$subj==i,]
+  # Perform regression:
+  reg_result <- lm(tpe_tmp$TPE ~ tpe_tmp$Time)
+  # Get coefficient:
+  tmp_coef <- coef(reg_result)
+  # Store coefficient:
+  tpe_coefs2[i] <- tmp_coef[2]
+}
+
+decline1 <- data.frame(tpe_coefs1) %>%
+  rownames_to_column(var = "subj") %>%
+  mutate(session = "1") %>%
+  dplyr::rename(decline = "tpe_coefs1")
+
+decline2 <- data.frame(tpe_coefs2) %>%
+  rownames_to_column(var = "subj") %>%
+  mutate(session = "2") %>%
+  dplyr::rename(decline = "tpe_coefs2")
+
+decline <- full_join(decline1, decline2)
+
+# now filter the original data frame to remove the first 500 seconds and join the "decline" data frame to the model
+data_all <- data %>%
+  filter(Time >= 500) %>%
+  left_join(decline, by = c("subj", "session"))
+
+```
+
+```{r creating a baseline column ad exploring data}
+
+#Create baseline TPE score
+a <- data_all %>% filter(session == "1") %>%
+  dplyr::rename(baseline = "TPE", in_slope = "slope", in_intercept = "intercept", in_paf = "paf", in_cog = "cog") %>%
+  dplyr::select(subj, baseline, in_slope, in_intercept, in_paf, in_cog, Time, decline)
+
+b <- data_all %>% filter(session == "2") %>%
+  dplyr::rename(post_slope = "slope", post_intercept = "intercept", post_paf = "paf", post_cog = "cog") %>%
+  dplyr::select(Time, subj, TPE, post_slope, post_intercept, post_paf, post_cog, training)
+  
+almost_baselined <- full_join(b, a, by = c("subj", "Time")) %>%
+  na.omit()
+
+baselined <- full_join(almost_baselined, maas.2, by = "subj") %>%
+  filter(subj != "CT22" & subj != "CT25" & subj != "CT14" & subj != "CT39" & subj != "CT47")
+
+baselined$subj <- as.factor(baselined$subj)
+
+data_with_skew <- left_join(baselined, ct_skew, by = "subj")
+
+```
+
+```{r modelling with baseline}
+
+#Models with just cognitive training and TPE
+summary(baselined$training)
+lmer_ct_withdecline <- lmer(TPE ~ ns(Time, 4) * training + baseline + decline + (1 | subj), data = baselined)
+
+#Testing with random slopes (did not converge)
+#lmer2 <- lmer(TPE ~ training + baseline + decline + (Time | subj), data = baselined)
+
+Anova(lmer_ct_withdecline)
+summary(lmer_ct_withdecline)
+model_performance(lmer_ct_withdecline)
+check_model(lmer_ct_withdecline)
+
+data_ct <- ggemmeans(lmer_ct_withdecline,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]"),
+                     ci.lvl = 0.83)
+
+lmer_ct.effects <- data_ct %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence")))
+
+plot.ct <- ggplot(lmer_ct.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  ylab("Tactical Picture Error") +
+  ggtitle("A. Effect of Adherence on Performance") +
+  scale_y_continuous(breaks = c(0, 2000, 4000, 6000, 8000)) +
+  xlab("Time [20s]") +
+  theme_bw() +
+  theme(legend.position="top",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+plot.ct
+
+tiff("model_enagegement_with_baseline.tiff", units="in", width=10, height=8, res=300)
+plot.ct
+dev.off()
+
+#Model with cognitive training, tpe and MAAS scores
+summary(baselined$MAAS)
+
+lmer_maas <- lmer(TPE ~ ns(Time, 4) * training * MAAS + decline + baseline + (1 | subj), data = baselined)
+
+Anova(lmer_maas)
+summary(lmer_maas)
+model_performance(lmer_maas)
+check_model(lmer_maas)
+
+data_maas <- ggemmeans(lmer_maas,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]", "MAAS [2.83, 3.494, 4.0]"),
+                     ci.lvl = 0.83)
+
+lmer_maas.effects <- data_maas %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence")),
+         MAAS = factor(facet, labels = c("Low MAAS","Moderate MAAS","High MAAS")))
+
+plot.maas <- ggplot(lmer_maas.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  facet_grid(~MAAS) +
+  ylab("Tactical Picture Error") +
+  ggtitle("A. Interaction between MAAS scores and Adherence") +
+  scale_y_continuous(breaks = c(0, 2000, 4000, 6000, 8000)) +
+  xlab("Time [20s]") +
+  theme_bw() +
+  theme(legend.position="top",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+plot.maas
+
+#Plot with geom-smooth()
+ggplot(lmer_maas.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_smooth() +
+  facet_grid(~MAAS) +
+  ylab("Tactical Picture Error") +
+  scale_y_continuous(breaks = c(0, 2000, 4000, 6000, 8000)) +
+  xlab("Time [20s]") +
+  theme_bw() +
+  theme(legend.position="top",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+tiff("model_enagegement_with_MAAS.tiff", units="in", width=12, height=8, res=300)
+plot.maas
+dev.off()
+
+#Model with initial slope * training
+summary(baselined$in_slope)
+
+lmer_slope <- lmer(TPE ~ ns(Time, 4) * in_slope * training + baseline + decline + (1 | subj), data = baselined)
+
+Anova(lmer_slope)
+summary(lmer_slope)
+model_performance(lmer_slope)
+check_model(lmer_slope)
+
+data_inslope <- ggemmeans(lmer_slope,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]", "in_slope [-1.23, -1.02, -0.83]"), 
+                     ci.lvl = 0.83)
+
+lmer_slope.effects <- data_inslope %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence"))) %>%
+  mutate(in_slope = factor(facet, labels = c("Steep","Moderate","Flatter")))
+
+plot.slope <- ggplot(lmer_slope.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  facet_grid(~in_slope) +
+  ylab("Tactical Picture Error") +
+  scale_y_continuous(breaks = c(0, 2000, 4000, 6000, 8000)) +
+  xlab("Time [20s]") +
+  ggtitle("B. Interaction between 1/f Slope and Adherence") +
+  theme_bw() +
+  theme(legend.position="top",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+plot.slope
+
+tiff("model_slope_engagement.tiff", units="in", width=10, height=8, res=300)
+plot.slope
+dev.off()
+
+#Model with initial IAF * training
+summary(baselined$in_cog)
+lmer_IAF <- lmer(TPE ~ ns(Time, 4) * in_cog * training  + baseline + decline + (1 | subj), data = baselined)
+
+Anova(lmer_IAF)
+summary(lmer_IAF)
+model_performance(lmer_IAF)
+check_model(lmer_IAF)
+
+data_inIAF <- ggemmeans(lmer_IAF,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]", "in_cog [9.25, 9.924, 10.5]"), 
+                     ci.lvl = 0.83)
+
+lmer_IAF.effects <- data_inIAF %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence"))) %>%
+  mutate(in_slope = factor(facet, labels = c("Low (<9.75)","Moderate (10.25)","High (>10.5)")))
+
+plot.IAF <- ggplot(lmer_IAF.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  facet_grid(~in_slope) +
+  ylab("Tactical Picture Error") +
+  ggtitle("B. Interaction between IAF and Adherence") +
+  scale_y_continuous(breaks = c(0, 2000, 4000, 6000, 8000)) +
+  xlab("Time [20s]") +
+  theme_bw() +
+  theme(legend.position="top",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+plot.IAF
+
+tiff("model_iaf_engagament.tiff", units="in", width=10, height=8, res=300)
+plot.IAF
+dev.off()
+
+#Initial Intercept on Performance
+summary(baselined$in_intercept)
+
+lmer_int <- lmer(TPE ~ ns(Time, 4) * in_intercept * training  + baseline + decline + (1 | subj), data = baselined)
+
+Anova(lmer_int)
+summary(lmer_int)
+model_performance(lmer_int)
+check_model(lmer_int)
+
+data_inint <- ggemmeans(lmer_int,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]", "in_intercept [-25.79, -25.11, -24.50]"), 
+                     ci.lvl = 0.83)
+
+lmer_int.effects <- data_inint %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence"))) %>%
+  mutate(in_intercept = factor(facet, labels = c("High","Moderate","Low")))
+
+plot.int <- ggplot(lmer_int.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  facet_grid(~in_intercept) +
+  ylab("Tactical Picture Error") +
+  ggtitle("D. Interaction between 1/f Intercept and Adherence") +
+  scale_y_continuous(breaks = c(0, 2000, 4000, 6000, 8000)) +
+  xlab("Time [20s]") +
+  theme_bw() +
+  theme(legend.position="top",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+plot.int
+
+tiff("model_iaf_engagament.tiff", units="in", width=10, height=8, res=300)
+plot.IAF
+dev.off()
+
+tiff("ct_maas_neural_models.tiff", units="in", width=15, height=10, res=300)
+ggarrange(plot.maas, plot.IAF, plot.slope, plot.int, common.legend = TRUE, ncol = 2, nrow = 2, legend = "bottom")
+dev.off()
+
+```
+
+##Modelling time of adherence (i.e., using skew)
+
+```{r skew models}
+
+#Models with cognitive training and TPE and skew (i.e., time of meditation practice)
+summary(data_with_skew$skew)
+describe(ct_skew)
+
+ggplot(data_with_skew, aes(x = skew)) +
+  geom_histogram()
+
+lmer_skew <- lmer(TPE ~ ns(Time, 4) * training * skew + baseline + decline + (1 | subj), data = data_with_skew)
+
+Anova(lmer_skew)
+summary(lmer_skew)
+model_performance(lmer_skew)
+check_model(lmer_skew)
+
+data_ct_skew <- ggemmeans(lmer_skew,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]", "skew [-1, 0, 1]"),
+                     ci.lvl = 0.83)
+
+lmer_skew.effects <- data_ct_skew %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence")),
+         when = factor(facet, labels = c("Negative Skew (Late Adherence)","Consistent Practice","Positive Skew (Early Adherence)")))
+
+plot.skew <- ggplot(lmer_skew.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  facet_wrap(~when) +
+  ylab("Tactical Picture Error") +
+  ggtitle("B. Interaction of Adherence and Skew") +
+  scale_y_continuous(breaks = c(0, 2000, 4000, 6000, 8000)) +
+  xlab("Time [20s]") +
+  theme_bw() +
+  theme(legend.position="bottom",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 10))
+
+plot.skew
+
+tiff("model_enagegement_with_skew.tiff", units="in", width=10, height=8, res=300)
+plot.skew
+dev.off()
+
+```
+
+#Modelling how neural metrics change according to engagement in cognitive training
+```{r models for predicting neural metric change}
+
+#preparing dataframe (don't need all tpe metrics)
+neural_metrics <- left_join(iaf_ap, ct, by = "subj") %>%
+  na.omit()
+
+neural_a <- neural_metrics %>% 
+  filter(session == "1") %>%
+  rename(in_slope = "slope", in_intercept = "intercept", in_paf = "paf", in_cog = "cog") %>%
+  dplyr::select(subj, in_slope, in_intercept, in_paf, in_cog)
+
+neural_b <- neural_metrics %>% filter(session == "2") %>%
+  rename(post_slope = "slope", post_intercept = "intercept", post_paf = "paf", post_cog = "cog", training = "total") %>%
+  dplyr::select(subj, post_slope, post_intercept, post_paf, post_cog, training)
+  
+neural_almost <- left_join(neural_b, neural_a, by = c("subj")) %>%
+  na.omit()
+
+neural_data <- neural_almost %>%
+  mutate(IAFchange = post_cog - in_cog,
+         slopechange = post_slope - in_slope,
+         intchange = post_intercept - in_intercept)
+
+describe(neural_data)
+
+#Modelling second neural metric from cognitive training
+lm.nc_IAF <- lm(post_cog ~ training + in_cog, data = neural_data)
+plot(lm.nc_IAF)
+summary(lm.nc_IAF)
+
+lm.nc_int <- lm(post_intercept ~ training + in_intercept, data = neural_data)
+summary(lm.nc_int)
+Anova(lm.nc_int)
+
+lm.nc_slope <- lm(post_slope ~ in_slope + training, data = neural_data)
+summary(lm.nc_slope)
+Anova(lm.nc_slope)
+
+```
+
+#Additional Analyses following April Meeting
+
+```{r personality}
+#Assessing whether enjoyment plays a role in benefits gained
+enjoy <- read_rds("enjoyment_summary.rds")
+
+range <- enjoy %>%
+  group_by(subj) %>%
+  count() %>%
+  mutate(observations = n/5)
+  
+enjoy_summary <- enjoy %>%
+  group_by(subj, measure) %>%
+  summarise(means = mean(score)) %>%
+  filter(subj != "CT22" & subj != "CT25" & subj != "" & subj != "CT52")
+
+ggplot(enjoy_summary, aes(x = measure, y = means)) +
+  geom_boxplot(aes(fill = measure), alpha = 0.3)
+
+to_join_enjoy <- pivot_wider(enjoy_summary, names_from = "measure", values_from = means)
+  
+baselined_enjoy <- left_join(baselined, to_join_enjoy, by = "subj")
+
+summary(baselined_enjoy$enjoy)
+lmer_enjoy_maas <- lmer(TPE ~ ns(Time, 4) * training * enjoy + baseline + decline + (1|subj), data = baselined_enjoy)
+summary(lmer_enjoy_maas)
+Anova(lmer_enjoy_maas)
+
+data_enjoym <- ggemmeans(lmer_enjoy_maas,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]", "enjoy [58.33, 71.42, 85.57]"),
+                     ci.lvl = 0.83)
+
+lmer_enjoym.effects <- data_enjoym %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence")),
+         enjoy = factor(facet, labels = c("Low Enjoyment", "Moderate Enjoyment", "High Enjoyment")))
+
+plot.enjoym <- ggplot(lmer_enjoym.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  facet_grid(~enjoy) +
+  ylab("Tactical Picture Error") +
+  xlab("Time [20s]") +
+  ggtitle("D. Interaction between Adherence and Enjoyment") +
+  theme_bw() +
+  theme(legend.position="top",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+plot.enjoym
+
+tiff("model_enagegement_with_enjoy.tiff", units="in", width=10, height=8, res=300)
+plot.enjoym
+dev.off()
+
+#Personality Effects
+personality_sum <- read_rds('personality_summary.rds')
+
+pn_TPE_maas <- personality_sum %>%
+  left_join(neural_metrics, by = "subj") %>%
+  left_join(mean_500, by = c("subj", "session")) %>%
+  left_join(maas.2, by = "subj")
+
+pn_enjoy <- left_join(pn_TPE_maas, to_join_enjoy, by = "subj")
+
+#Check how conscientiousness is related to adherence (relevant to reviewer comment)
+tiff("conscxengagement.tiff", units="in", width=6, height=6, res=300)
+pn_TPE_maas %>% 
+  filter(session == "1") %>%
+  na.omit() %>%
+  ggplot(aes(x = total, y = Conscientiousness)) +
+  geom_jitter(shape=20, size = 3, alpha = 0.5) +
+  geom_smooth(method=lm, fill = "lightgreen", colour = "black", linetype = "dotted") +
+  labs(y="Conscientiousness Score", x = "Cognitive Training Engagement") +
+  theme_light() +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=12),
+        plot.title = element_text(size=14, face="bold"),
+        axis.text.y = element_text(size=12)) +
+  stat_regline_equation() +
+  stat_cor(label.y = 38)
+dev.off()
+
+pn_enjoy_sk <- select(ct_skew, skew, subj) %>%
+  left_join(pn_enjoy, by = "subj")
+
+cplot_training <- pn_enjoy_sk %>% 
+  filter(session == "1") %>%
+  dplyr::select("Conscientiousness", "Neuroticism", "enjoy", "skew" , "enjoy", "MAAS", "total", "TPE", "slope", "cog", "intercept") %>%
+  rename(Slope = slope, IAF = cog, Intercept = intercept, Enjoy = enjoy, Skew = skew, Adherence = total)
+
+cplot_enjoy <- pn_enjoy %>% 
+  filter(session == "2") %>%
+  dplyr::select("calm", "distract", "energy", "enjoy", "success" , "Conscientiousness", "Neuroticism", "Mind-Wandering", "MAAS", "slope", "cog", "total", "TPE")
+
+#Looking at all correlations between variables
+library(corrplot)
+library(correlation)
+
+cor_data = cor(cplot_training, use="pairwise.complete.obs")
+
+tiff("corrplot.tiff", units="in", width=12, height=7, res=300)
+corrplot(cor_data, method="color", col=colorRampPalette(c("lightskyblue3","white","springgreen3"))(8),  
+         type="upper", order="hclust", 
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col="black", tl.srt=45, #Text label color and rotation
+         # Combine with significance
+         # hide correlation coefficient on the principal diagonal
+         diag=FALSE 
+         )
+dev.off()
+
+pairs.panels(cplot_training,
+             smooth = TRUE,      # If TRUE, draws loess smooths
+             scale = FALSE,      # If TRUE, scales the correlation text font
+             ellipses = FALSE,
+             density = TRUE,     # If TRUE, adds density plots and histograms
+             method = "pearson", # Correlation method (also "spearman" or "kendall")
+             pch = 21,           # pch symbol
+             lm = TRUE,         # If TRUE, plots linear fit rather than the LOESS (smoothed) fit
+             cor = TRUE,         # If TRUE, reports correlations
+             jiggle = FALSE,     # If TRUE, data points are jittered
+             factor = 2,         # Jittering factor
+             hist.col = 2,       # Histograms color
+             stars = TRUE,       # If TRUE, adds significance level with stars
+             ci = TRUE) 
+
+pairs.panels(cplot_enjoy,
+             smooth = TRUE,      # If TRUE, draws loess smooths
+             scale = FALSE,      # If TRUE, scales the correlation text font
+             ellipses = FALSE,
+             density = TRUE,     # If TRUE, adds density plots and histograms
+             method = "pearson", # Correlation method (also "spearman" or "kendall")
+             pch = 21,           # pch symbol
+             lm = TRUE,         # If TRUE, plots linear fit rather than the LOESS (smoothed) fit
+             cor = TRUE,         # If TRUE, reports correlations
+             jiggle = FALSE,     # If TRUE, data points are jittered
+             factor = 2,         # Jittering factor
+             hist.col = 2,       # Histograms color
+             stars = TRUE,       # If TRUE, adds significance level with stars
+             ci = TRUE) 
+
+person_model <- pn_TPE_maas %>%
+  janitor::clean_names() 
+
+baselined_person <- person_model %>%
+  filter(session == "1") %>%
+  dplyr::select(conscientiousness, neuroticism, openness_to_experience, subj) %>%
+  left_join(baselined, by = "subj")
+
+describe(baselined_person)
+
+#Modelling two personality variables
+lmer_big2 <- lmer(TPE ~ ns(Time, 4) * training * neuroticism * conscientiousness + baseline + decline + (1|subj), data = baselined_person)
+
+summary(lmer_big2)
+Anova(lmer_big2)
+model_performance(lmer_big2)
+check_model(lmer_big2)
+
+summary(baselined_person$neuroticism)
+summary(baselined_person$conscientiousness)
+summary(baselined_person$MAAS)
+
+data_ct_big5 <- ggemmeans(lmer_big2,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]", "conscientiousness [27, 29.86, 33]", "neuroticism [16, 20, 19.7]"),
+                     ci.lvl = 0.83)
+
+lmer_big5.effects <- data_ct_big5 %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence")),
+         conscientiousness = factor(facet, labels = c("Low Consc","Moderate Consc","High Consc")),
+         neuro = factor(panel, labels = c("Low Neur", "Moderate Neur", "High Neur")))
+
+plot.big5 <- ggplot(lmer_big5.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  facet_grid(conscientiousness ~ neuro) +
+  ylab("Tactical Picture Error") +
+  ggtitle("Interaction of Personality Factors and Adherence") +
+  scale_y_continuous(breaks = c(0, 2000, 4000, 6000, 8000)) +
+  xlab("Time [20s]") +
+  theme_bw() +
+  theme(legend.position="bottom",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+plot.big5
+
+#assessing if prior to sleep if useful
+sleep <- read.csv("sleep-mindful.csv") %>%
+  mutate(prior = as.factor(prior))
+
+summary(sleep)
+
+baselined_sleep <- left_join(baselined, sleep, by = "subj")
+
+#Modelling prior sleep and MAAS
+lmer_sleep <- lmer(TPE ~ ns(Time, 4) * training * prior + baseline + decline + (1|subj), data = baselined_sleep)
+summary(lmer_sleep)
+Anova(lmer_sleep)
+
+data_sleepm <- ggemmeans(lmer_sleep,
+                     terms = c("Time [all]", "training [4.00, 10.28, 16.00]", "prior[all]"),
+                     ci.lvl = 0.83)
+
+lmer_sleepm.effects <- data_sleepm %>% 
+  as_tibble() %>% 
+  mutate(training = factor(group, labels = c("Low Adherence","Moderate Adherence","Strict Adherence")),
+         sleep = factor(facet, labels = c("Prior to First Sleep", "After")))
+
+plot.sleep <- ggplot(lmer_sleepm.effects, aes(x,predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype=training)) +
+  scale_linetype_manual(values=c("solid", "longdash", "dotdash"), name = NULL) +
+  scale_fill_manual(values = c('lightskyblue1','palegreen',"tan"), name = NULL) +
+  scale_colour_manual(values = c('slateblue','springgreen3',"violetred")) +
+  geom_ribbon(aes(fill=training),alpha=0.3) +
+  facet_grid(~sleep) +
+  ylab("Tactical Picture Error") +
+  xlab("Time [20s]") +
+  ggtitle("C. Interaction of Sleep and Adherence") +
+  theme_bw() +
+  theme(legend.position="top",
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=16, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 14))
+
+plot.sleep
+
+#Assessing model fits 
+table <- compare_performance(lmer_big2, lmer_sleep, lmer_ct_withdecline, lmer_IAF, lmer_skew, lmer_int, lmer_maas, rank = TRUE)
+
+print(table)
+table <- compare_performance(lmer_consc_neuroticism, lmer_consc_neurotcism_maas, lmer_neuroticism_maas, lmer_ct_withdecline, lmer_maas_iaf, lmer_ct_withdecline, lmer_enjoy_maas, lmer_sleep_maas, lmer_skew, lmer_conscientiousness_maas, lmer_maas, lmer_IAF, lmer_slope, lmer_int,  rank = TRUE)
+
+summary(tmod)$table
+
+#Creating Plots for Manuscript
+tiff("ct_individual_factors.tiff", units="in", width=15, height=10, res=300)
+ggarrange(plot.ct, plot.skew, plot.sleep, plot.enjoym, common.legend = TRUE, ncol = 2, nrow = 2, legend = "bottom")
+dev.off()
+
+tiff("big5.tiff", units="in", width=9, height=8, res=300)
+plot.big5
+dev.off()
+```
+
+#Create Model Output Tables for Latex
+
+```{r create tables}
+
+library(lmerOut)
+library(kableExtra)
+
+#models with just cognitive training and TPE
+lmer_ct_withdecline <- lmer(TPE ~ ns(Time, 4) * training + baseline + decline + (1 | subj), data = baselined)
+kable(Anova(lmer_ct_withdecline), "latex", caption = "Summary of effects of Engagement on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/engagement.pdf", keep_tex = TRUE)
+pprint(lmer_ct_withdecline, "data-csvs/tables/engagement_summary.tex")
+
+#model with cognitive training, tpe and MAAS scores
+lmer_maas <- lmer(TPE ~ ns(Time, 4) * training * MAAS + decline + baseline + (1 | subj), data = baselined)
+kable(Anova(lmer_maas), "latex", caption = "Summary of effects of Engagement and MAAS on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/maas.pdf", keep_tex = TRUE)
+pprint(lmer_maas, "data-csvs/tables/maas_summary.tex")
+
+#Model with initial slope * training
+lmer_slope <- lmer(TPE ~ ns(Time, 4) * in_slope * training + baseline + decline + (1 | subj), data = baselined)
+kable(Anova(lmer_slope), "latex", caption = "Summary of effects of Engagement and 1/f Slope on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/slope.pdf", keep_tex = TRUE)
+pprint(lmer_slope, "data-csvs/tables/slope_summary.tex")
+
+#Model with initial IAF * training
+lmer_IAF <- lmer(TPE ~ ns(Time, 4) * in_cog * training  + baseline + decline + (1 | subj), data = baselined)
+kable(Anova(lmer_IAF), "latex", caption = "Summary of effects of Engagement and IAF on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/iaf.pdf", keep_tex = TRUE)
+pprint(lmer_IAF, "data-csvs/tables/iaf_summary.tex")
+
+#Initial Intercept on Performance
+lmer_int <- lmer(TPE ~ ns(Time, 4) * in_intercept * training  + baseline + decline + (1 | subj), data = baselined)
+kable(Anova(lmer_int), "latex", caption = "Summary of effects of Engagement and 1/f Intercept on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/intercept.pdf", keep_tex = TRUE)
+pprint(lmer_int, "data-csvs/tables/intercept_summary.tex")
+
+#Model with Skew
+lmer_skew <- lmer(TPE ~ ns(Time, 4) * training * skew + baseline + decline + (1 | subj), data = data_with_skew)
+kable(Anova(lmer_skew), "latex", caption = "Summary of effects of Engagement and Skew on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/skew.pdf", keep_tex = TRUE)
+pprint(lmer_skew, "data-csvs/tables/skew_summary.tex")
+
+#Enjoyment Model
+lmer_enjoy_maas <- lmer(TPE ~ ns(Time, 4) * training * enjoy + baseline + decline + (1|subj), data = baselined_enjoy)
+kable(Anova(lmer_enjoy_maas), "latex", caption = "Summary of effects of Engagement and Enjoyment on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/enjoy.pdf", keep_tex = TRUE)
+pprint(lmer_enjoy_maas, "data-csvs/tables/enjoyment_summary.tex")
+
+#Personality model
+lmer_big2 <- lmer(TPE ~ ns(Time, 4) * training * neuroticism * conscientiousness + baseline + decline + (1|subj), data = baselined_person)
+kable(Anova(lmer_big2), "latex", caption = "Summary of effects of Engagement, Neuroticism and Conscientiousness on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/big2.pdf", keep_tex = TRUE)
+pprint(lmer_big2, "data-csvs/tables/big2_summary.tex")
+
+#prior sleep and MAAS
+lmer_sleep <- lmer(TPE ~ ns(Time, 4) * training * prior + baseline + decline + (1|subj), data = baselined_sleep)
+kable(Anova(lmer_sleep), "latex", caption = "Summary of effects of Engagement and Sleep on TPE Scores (Type II Wald Tests)", booktabs = T) %>%
+  save_kable("data-csvs/tables/sleep.pdf", keep_tex = TRUE)
+pprint(lmer_sleep, "data-csvs/tables/sleep_summary.tex")
+
+```
